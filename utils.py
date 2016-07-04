@@ -39,14 +39,14 @@ def rollout(envs, agent, n_timesteps, bs):
                 obs[i].append(ob[i])
                 state[i].append(copy.copy(np.expand_dims(agent.state_n[i], 0)))
         less = np.less(timesteps_sofar, timesteps_sofar * 0.0 + n_timesteps)
-        action, info = agent.act(np.concatenate(ob, 0), less)
+        action, action_dist_n = agent.act(np.concatenate(ob, 0), less)
 
         for i, env in enumerate(envs):
             if timesteps_sofar[i] >= n_timesteps:
                 continue
-            actions[i].append(int(action[i]))
-            action_dists[i].append(np.expand_dims(info[i, :], 0))
-            res = env.step(int(action[i]))
+            actions[i].append(action[i, :])
+            action_dists[i].append(np.expand_dims(action_dist_n[i, :], 0))
+            res = env.step(action[i, :])
             ob[i] = np.expand_dims(res[0], 0)
             rewards[i].append(res[1])
             agent.rewards_sum[i] += res[1]
@@ -71,6 +71,26 @@ def rollout(envs, agent, n_timesteps, bs):
 
     return paths
 
+class LinearVF(object):
+    coeffs = None
+
+    def _features(self, path):
+        o = path["obs"].astype('float32')
+        o = o.reshape(o.shape[0], -1)
+        l = len(path["rewards"])
+        al = np.arange(l).reshape(-1, 1) / 100.0
+        return np.concatenate([o, o**2, al, al**2, np.ones((l, 1))], axis=1)
+
+    def fit(self, paths):
+        featmat = np.concatenate([self._features(path) for path in paths])
+        returns = np.concatenate([path["returns"] for path in paths])
+        n_col = featmat.shape[1]
+        lamb = 2.0
+        self.coeffs = np.linalg.lstsq(featmat.T.dot(featmat) + lamb * np.identity(n_col), featmat.T.dot(returns))[0]
+
+    def predict(self, path):
+        return np.zeros(len(path["rewards"])) if self.coeffs is None else self._features(
+            path).dot(self.coeffs)
 
 class VF(object):
     coeffs = None
@@ -91,7 +111,7 @@ class VF(object):
             l2 = (self.net - self.y) * (self.net - self.y)
             self.train = tf.train.AdamOptimizer().minimize(l2)
             self.session.run(tf.initialize_all_variables())
-        
+
 
     def _features(self, path):
         o = path["obs"].astype('float32')
@@ -112,7 +132,7 @@ class VF(object):
 
     def predict(self, path):
         if self.net is None:
-            return np.zeros(len(path["rewards"])) 
+            return np.zeros(len(path["rewards"]))
         else:
             ret = self.session.run(self.net, {self.x: self._features(path)})
             return np.reshape(ret, (ret.shape[0], ))

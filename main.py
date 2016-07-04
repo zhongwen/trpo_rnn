@@ -1,3 +1,5 @@
+from policy_net import *
+from prob_type import *
 from utils import *
 import numpy as np
 import random
@@ -9,7 +11,6 @@ import gym
 from gym import envs, scoreboard
 from gym.spaces import Discrete, Box
 import prettytensor as pt
-from space_conversion import SpaceConversionEnv
 import tempfile
 import sys
 
@@ -17,9 +18,11 @@ eps = 1e-6
 
 config = dict2(**{
     "timesteps": 10,
-    "bs": 100,
-    "gamma": 0.95,
-    "max_kl": 0.05})
+    "bs": 32,
+    "gamma": 0.995,
+    "max_kl": 0.1})
+
+OUTPUT_DIR = '/tmp/TRPO_RNN/train/'
 
 
 class TRPO_RNN_Agent(object):
@@ -27,34 +30,39 @@ class TRPO_RNN_Agent(object):
     def __init__(self, envs):
         self.envs = envs
         if not isinstance(envs[0].observation_space, Box) or \
-           not isinstance(envs[0].action_space, Discrete):
+           not isinstance(envs[0].action_space, Box):
             print("Incompatible spaces.")
             exit(-1)
         self.session = tf.Session()
         n = envs[0].observation_space.shape[0]
         timesteps = config.timesteps
         bs = config.bs
+        self.action_dim = env.action_space.shape[0]
         self.end_count = 0
         self.train = True
-        self.obs_single = obs_single = tf.placeholder(dtype, shape=[bs, n], name="obs_single")
-        self.obs_multi = obs_multi = tf.placeholder(dtype, shape=[timesteps, bs, n], name="obs_multi")
-        self.done = done = tf.placeholder(dtype, shape=[timesteps, bs], name="done")  
-        self.action = action = tf.placeholder(tf.int64, shape=[timesteps, bs], name="action")  
-        self.advant = advant = tf.placeholder(dtype, shape=[timesteps, bs], name="advant")  
-        self.state_size = 60
-        self.state = state = tf.placeholder(dtype, shape=[bs, self.state_size], name="state")  
-        self.oldaction_dist = oldaction_dist = tf.placeholder(dtype, shape=[timesteps, bs, envs[0].action_space.n], name="oldaction_dist")
+        self.obs_single = obs_single = tf.placeholder(
+            dtype, shape=[bs, n], name="obs_single")
+        self.obs_multi = obs_multi = tf.placeholder(
+            dtype, shape=[timesteps, bs, n], name="obs_multi")
+        self.done = done = tf.placeholder(
+            dtype, shape=[timesteps, bs], name="done")
+        self.distribution = DiagGauss(self.action_dim)
+        self.action = action = tf.placeholder(
+            tf.float32, shape=[timesteps, bs, self.action_dim], name="action")
+        self.advant = advant = tf.placeholder(
+            dtype, shape=[timesteps, bs], name="advant")
+        self.state_size = 16
+        self.state = state = tf.placeholder(
+            dtype, shape=[bs, self.state_size], name="state")
+        self.oldaction_dist = oldaction_dist = tf.placeholder(
+            dtype, shape=[timesteps, bs, self.action_dim * 2], name="oldaction_dist")
 
         # Create neural network.
 
         with tf.variable_scope("basic_rnn") as scope:
-            rnn = tf.nn.rnn_cell.BasicRNNCell(self.state_size)
+            rnn = tf.nn.rnn_cell.GRUCell(self.state_size)
             output, self.new_state = rnn(obs_single, state)
-            action_dist_n, _ = (pt.wrap(output).
-                           softmax_classifier(envs[0].action_space.n))  
-            action_dist_n = tf.minimum(action_dist_n, 1.0 - eps)
-            action_dist_n = tf.maximum(action_dist_n, eps)
-            action_dist_n /= tf.expand_dims(tf.reduce_sum(action_dist_n, 1), 1)
+            action_dist_n = construct_policy_net(output, self.action_dim)
 
         self.action_dist_n = action_dist_n
         surr, kl, ent, kl_firstfixed = 0.0, 0.0, 0.0, 0.0
@@ -68,34 +76,51 @@ class TRPO_RNN_Agent(object):
                 output, state = rnn(o, state)
                 d = tf.reshape(done[i, :], (bs, 1))
                 d = tf.tile(d, (1, self.state_size))
-                state = tf.select(tf.less(d, d * 0.0 + 1e-4), state, state * 0.0)
-                action_dist_n, _ = (pt.wrap(output).
-                               softmax_classifier(envs[0].action_space.n))
-
-                action_dist_n = tf.minimum(action_dist_n, 1.0 - eps)
-                action_dist_n = tf.maximum(action_dist_n, eps)
-                action_dist_n /= tf.expand_dims(tf.reduce_sum(action_dist_n, 1), 1)
-
-                p_n = slice_2d(action_dist_n, tf.range(0, bs), action[i, :])
-                oldp_n = slice_2d(oldaction_dist[i, :, :], tf.range(0, bs), action[i, :])
+                # if done, clear the state.
+                state = tf.select(
+                    tf.less(d, d * 0.0 + 1e-4),
+                    state, state * 0.0)
+                action_dist_n = construct_policy_net(output, self.action_dim)
+                p_n = self.distribution.loglikelihood(
+                    action[i, :, :], action_dist_n)
+                oldp_n = self.distribution.loglikelihood(
+                    action[i, :, :], self.oldaction_dist[i, :, :])
 
                 ratio_n = p_n / oldp_n
-                surr += -tf.reduce_sum(ratio_n * advant[i, :]) / float(timesteps * bs)
-                single_kl = oldaction_dist[i, :, :] * tf.log(oldaction_dist[i, :, :] / action_dist_n)
-                single_kl = tf.select(tf.greater(oldaction_dist[i, :, :], eps), single_kl, tf.stop_gradient(oldaction_dist[i, :, :] * 0.0))
+                surr += -tf.reduce_sum(ratio_n * advant[i, :]
+                                       ) / float(timesteps * bs)
+                single_kl = self.distribution.kl(
+                    oldaction_dist[i, :, :], action_dist_n)
+                # single_kl = tf.select(
+                # tf.greater(
+                # oldaction_dist[
+                # i, :, :self.action_dim], eps), single_kl, tf.stop_gradient(
+                # oldaction_dist[
+                # i, :, :self.action_dim] * 0.0))
                 kl += tf.reduce_sum(single_kl) / float(timesteps * bs)
 
-                single_ent = -action_dist_n * tf.log(action_dist_n)
-                single_ent = tf.select(tf.greater(action_dist_n, eps), single_ent, tf.stop_gradient(single_ent * 0.0))
+                single_ent = self.distribution.entropy(
+                    action_dist_n)
+                # single_ent = tf.select(
+                # tf.greater(
+                # action_dist_n, eps), single_ent, tf.stop_gradient(
+                # single_ent * 0.0))
                 ent += tf.reduce_sum(single_ent) / float(timesteps * bs)
 
-                single_kl_first = tf.stop_gradient(action_dist_n) * tf.log(tf.stop_gradient(action_dist_n) / action_dist_n)
-                single_kl_first = tf.select(tf.greater(action_dist_n, eps), single_kl_first, tf.stop_gradient(single_kl_first * 0.0))
-                kl_firstfixed += tf.reduce_sum(single_kl_first) / float(timesteps * bs)
+                single_kl_first = self.distribution.kl(
+                        tf.stop_gradient(action_dist_n), action_dist_n)
+                # single_kl_first = tf.select(
+                # tf.greater(
+                # action_dist_n, eps), single_kl_first, tf.stop_gradient(
+                # single_kl_first * 0.0))
+                kl_firstfixed += tf.reduce_sum(
+                    single_kl_first) / float(timesteps * bs)
 
         self.entropy = ent
         self.kl = kl
         self.surr = surr
+        train_writer = tf.train.SummaryWriter(OUTPUT_DIR, self.session.graph)
+        train_writer.add_graph(self.session.graph)
         var_list = tf.trainable_variables()
         self.losses = [surr, kl, ent]
         self.pg = flatgrad(surr, var_list)
@@ -116,7 +141,7 @@ class TRPO_RNN_Agent(object):
         self.gf = GetFlat(self.session, var_list)
         self.sff = SetFromFlat(self.session, var_list)
         self.session.run(tf.initialize_variables(var_list))
-        self.vf = VF(self.session)
+        self.vf = LinearVF()
 
     def learn(self):
         start_time = time.time()
@@ -128,11 +153,12 @@ class TRPO_RNN_Agent(object):
         while True:
             # Generating paths.
             print("\nGathering trajectories")
-            
+
             pathss = rollout(self.envs, self, config.timesteps, config.bs)
 
             # Computing returns and estimating advantage function.
-            obs_n, done_n, action_n, advant_n, action_dist_n, baseline_n, returns_n, init_state_n = [], [], [], [], [], [], [], []
+            obs_n, done_n, action_n, advant_n, action_dist_n, baseline_n, returns_n, init_state_n = [
+                ], [], [], [], [], [], [], []
             for paths in pathss:
                 for path in paths:
                     path["baseline"] = self.vf.predict(path)
@@ -142,12 +168,25 @@ class TRPO_RNN_Agent(object):
                     returns_n += path["returns"].tolist()
 
                 # Updating policy.
-                init_state_n.append(np.concatenate([path["state"] for path in paths])[-config.timesteps])
-                action_dist_n.append(np.concatenate([path["action_dists"] for path in paths])[-config.timesteps:, :])
-                obs_n.append(np.concatenate([path["obs"] for path in paths])[-config.timesteps:, :])
-                done_n.append(np.concatenate([path["done"] for path in paths])[-config.timesteps:])
-                action_n.append(np.concatenate([path["actions"] for path in paths])[-config.timesteps:])
-                advant_n.append(np.concatenate([path["advants"] for path in paths])[-config.timesteps:])
+                init_state_n.append(
+                    np.concatenate([path["state"] for path in paths])
+                    [-config.timesteps])
+                action_dist_n.append(np.concatenate(
+                                         [path["action_dists"]
+                                          for path in paths])
+                                     [-config.timesteps:, :])
+                obs_n.append(
+                    np.concatenate([path["obs"] for path in paths])
+                    [-config.timesteps:, :])
+                done_n.append(
+                    np.concatenate([path["done"] for path in paths])
+                    [-config.timesteps:])
+                action_n.append(
+                    np.concatenate([path["actions"] for path in paths])
+                    [-config.timesteps:])
+                advant_n.append(
+                    np.concatenate([path["advants"] for path in paths])
+                    [-config.timesteps:])
 
             paths = [path for paths in pathss for path in paths]
             print "\n********** Iteration %i ************" % i
@@ -156,11 +195,14 @@ class TRPO_RNN_Agent(object):
                 [path["rewards_sum"].sum() for path in paths])
             episoderewards = np.array(episoderewards)
 
-            print("Average sum of rewards per episode = %f" % episoderewards.mean(), self.envs[0]._env.spec.reward_threshold)
-            if episoderewards.mean() > self.envs[0]._env.spec.reward_threshold:
-                self.train = False
-                print("Skipping")
-                continue
+            print(
+                "Average sum of rewards per episode = %f" %
+                episoderewards.mean())
+            # self.envs[0]._env.spec.reward_threshold)
+            # if episoderewards.mean() > self.envs[0]._env.spec.reward_threshold:
+            # self.train = False
+            # print("Skipping")
+            # continue
             if not self.train:
                 print(episoderewards)
                 self.end_count += 1
@@ -169,7 +211,13 @@ class TRPO_RNN_Agent(object):
                 continue
             print("Training")
 
-            objs = ["obs_n", "done_n", "action_n", "advant_n", "action_dist_n", "init_state_n"]
+            objs = [
+                "obs_n",
+                "done_n",
+                "action_n",
+                "advant_n",
+                "action_dist_n",
+                "init_state_n"]
 
             feed = {self.obs_multi: obs_n,
                     self.done: done_n,
@@ -181,7 +229,6 @@ class TRPO_RNN_Agent(object):
                 obj = np.concatenate([np.expand_dims(o, 1) for o in obj], 1)
                 feed[k] = obj
             feed[self.state] = init_state_n
-
 
             feed[self.advant] -= feed[self.advant].mean()
             feed[self.advant] /= (feed[self.advant].std() + 1e-8)
@@ -209,38 +256,45 @@ class TRPO_RNN_Agent(object):
             theta = thprev + fullstep
             self.sff(theta)
 
-            surrafter, kl, entropy = self.session.run(self.losses, feed_dict=feed)   
+            surrafter, kl, entropy = self.session.run(
+                self.losses, feed_dict=feed)
             stats = []
             for path in paths:
                 numeptotal += len(path["rewards"])
             stats.append(("Total number of timesteps", numeptotal))
-            stats.append(("Time elapsed", "%.2f mins" % ((time.time() - start_time) / 60.0)))
+            stats.append(
+                ("Time elapsed", "%.2f mins" %
+                 ((time.time() - start_time) / 60.0)))
             stats.append(("Entropy", entropy))
             stats.append(("KL between old and new distribution", kl))
             exp = explained_variance(np.array(baseline_n), np.array(returns_n))
             stats.append(("Baseline explained", exp))
             stats.append(("Surrogate loss after", surrafter))
-            stats.append(("Average sum of rewards per episode", episoderewards.mean()))
-            stats.append(("Max sum of rewards per episode", episoderewards.max()))
+            stats.append(
+                ("Average sum of rewards per episode",
+                 episoderewards.mean()))
+            stats.append(
+                ("Max sum of rewards per episode",
+                 episoderewards.max()))
             for k, v in stats:
                 print(k + ": " + " " * (40 - len(k)) + str(v))
             if entropy != entropy:
                 exit(-1)
-            if episoderewards.mean() > 0.8 * self.envs[0]._env.spec.reward_threshold:
-                config.train = False
-            if exp > 0.8 or entropy < 0.05:
-                self.train = False
+            # if episoderewards.mean(
+                # ) > 0.8 * self.envs[0]._env.spec.reward_threshold:
+                # config.train = False
+            # if exp > 0.8 or entropy < 0.05:
+                # self.train = False
 
     def act(self, obs, timesteps_sofar):
         inp = {self.obs_single: obs, self.state: self.state_n}
-        action_dist_n, new_state_n = self.session.run([self.action_dist_n, self.new_state], inp)
+        action_dist_n, new_state_n = self.session.run(
+            [self.action_dist_n, self.new_state], inp)
         for j in range(timesteps_sofar.shape[0]):
             if timesteps_sofar[j]:
                 self.state_n[j, :] = copy.copy(new_state_n[j, :])
-        if self.train:
-            action = cat_sample(action_dist_n)
-        else:
-            action = np.argmax(action_dist_n, 1)
+        action = self.distribution.sample(action_dist_n)
+        # action = action.flatten()
         return action, action_dist_n
 
 
@@ -249,13 +303,12 @@ logging.getLogger().setLevel(logging.DEBUG)
 if len(sys.argv) > 1:
     task = sys.argv[1]
 else:
-    task = "Copy-v0"
+    task = "Pendulum-v0"
 
 envs = []
 for i in range(config.bs):
     env = gym.envs.make(task)
     env.monitor.start(training_dir)
-    env = SpaceConversionEnv(env, Box, Discrete)
     envs.append(env)
     if i != 0:
         env.monitor.configure(video_callable=lambda episode_id: False)
@@ -266,5 +319,3 @@ for env in envs:
     env.monitor.close()
 print("Training dir: %s" % training_dir)
 gym.upload(training_dir, algorithm_id='trpo_rnn')
-
-
