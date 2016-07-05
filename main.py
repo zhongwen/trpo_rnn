@@ -25,6 +25,7 @@ flags.DEFINE_integer('bs', 32, 'batch size')
 flags.DEFINE_float('gamma', 0.995, 'discount factor')
 flags.DEFINE_float('max_kl', 0.1, 'KL delta in TRPO constraint.')
 flags.DEFINE_float('cg_damping', 1e-3, 'CG damping parameter')
+flags.DEFINE_float('lam', 0.95, 'GAE param')
 
 OUTPUT_DIR = '/tmp/TRPO_RNN/train/'
 
@@ -37,6 +38,7 @@ class TRPO_RNN_Agent(object):
         gamma=FLAGS.gamma,
         max_kl=FLAGS.max_kl,
         cg_damping=FLAGS.cg_damping,
+        lam=FLAGS.lam,
     )
 
     def __init__(self, envs):
@@ -179,8 +181,11 @@ class TRPO_RNN_Agent(object):
             for paths in pathss:
                 for path in paths:
                     path["baseline"] = self.vf.predict(path)
+                    path_baselines = np.append(path["baseline"], 0)
                     path["returns"] = discount(path["rewards"], config.gamma)
-                    path["advants"] = path["returns"] - path["baseline"]
+                    deltas = path["rewards"] + config.gamma * path_baselines[1:] - path_baselines[:-1]
+                    path["advants"] = discount(deltas, config.gamma * config.lam)
+
                     baseline_n += path["baseline"].tolist()
                     returns_n += path["returns"].tolist()
 
