@@ -24,6 +24,7 @@ flags.DEFINE_integer('timesteps', 10, 'time steps for recurrent policy')
 flags.DEFINE_integer('bs', 32, 'batch size')
 flags.DEFINE_float('gamma', 0.995, 'discount factor')
 flags.DEFINE_float('max_kl', 0.1, 'KL delta in TRPO constraint.')
+flags.DEFINE_float('cg_damping', 1e-3, 'CG damping parameter')
 
 OUTPUT_DIR = '/tmp/TRPO_RNN/train/'
 
@@ -34,7 +35,8 @@ class TRPO_RNN_Agent(object):
         timesteps=FLAGS.timesteps,
         bs=FLAGS.bs,
         gamma=FLAGS.gamma,
-        max_kl=FLAGS.max_kl
+        max_kl=FLAGS.max_kl,
+        cg_damping=FLAGS.cg_damping,
     )
 
     def __init__(self, envs):
@@ -242,7 +244,7 @@ class TRPO_RNN_Agent(object):
 
             def fisher_vector_product(p):
                 feed[self.flat_tangent] = p
-                return self.session.run(self.fvp, feed)
+                return self.session.run(self.fvp, feed) + p * config.cg_damping
 
             g = self.session.run(self.pg, feed_dict=feed)
             stepdir = conjugate_gradient(fisher_vector_product, -g)
