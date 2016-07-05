@@ -1,31 +1,41 @@
-from policy_net import *
-from prob_type import *
-from utils import *
-import numpy as np
-import random
-import tensorflow as tf
+import copy
 import time
-import os
 import logging
-import gym
-from gym import envs, scoreboard
-from gym.spaces import Discrete, Box
-import prettytensor as pt
 import tempfile
 import sys
 
+import numpy as np
+import tensorflow as tf
+import gym
+from gym.spaces import Box
+
+from policy_net import construct_policy_net
+from prob_type import DiagGauss
+from utils import discount, rollout, LinearVF
+from utils import flatgrad, SetFromFlat, GetFlat, linesearch, conjugate_gradient
+from utils import dict2, var_shape, explained_variance
+from utils import dtype
+
 eps = 1e-6
 
-config = dict2(**{
-    "timesteps": 10,
-    "bs": 32,
-    "gamma": 0.995,
-    "max_kl": 0.1})
+flags = tf.app.flags
+FLAGS = flags.FLAGS
+flags.DEFINE_integer('timesteps', 10, 'time steps for recurrent policy')
+flags.DEFINE_integer('bs', 32, 'batch size')
+flags.DEFINE_float('gamma', 0.995, 'discount factor')
+flags.DEFINE_float('max_kl', 0.1, 'KL delta in TRPO constraint.')
 
 OUTPUT_DIR = '/tmp/TRPO_RNN/train/'
 
 
 class TRPO_RNN_Agent(object):
+
+    config = dict2(
+        timesteps=FLAGS.timesteps,
+        bs=FLAGS.bs,
+        gamma=FLAGS.gamma,
+        max_kl=FLAGS.max_kl
+    )
 
     def __init__(self, envs):
         self.envs = envs
@@ -34,6 +44,7 @@ class TRPO_RNN_Agent(object):
             print("Incompatible spaces.")
             exit(-1)
         self.session = tf.Session()
+        config = self.config
         n = envs[0].observation_space.shape[0]
         timesteps = config.timesteps
         bs = config.bs
@@ -55,7 +66,9 @@ class TRPO_RNN_Agent(object):
         self.state = state = tf.placeholder(
             dtype, shape=[bs, self.state_size], name="state")
         self.oldaction_dist = oldaction_dist = tf.placeholder(
-            dtype, shape=[timesteps, bs, self.action_dim * 2], name="oldaction_dist")
+            dtype, shape=[timesteps, bs, self.action_dim * 2],
+            name="oldaction_dist"
+        )
 
         # Create neural network.
 
@@ -144,6 +157,7 @@ class TRPO_RNN_Agent(object):
         self.vf = LinearVF()
 
     def learn(self):
+        config = self.config
         start_time = time.time()
         numeptotal = 0
         pathss = None
@@ -157,8 +171,9 @@ class TRPO_RNN_Agent(object):
             pathss = rollout(self.envs, self, config.timesteps, config.bs)
 
             # Computing returns and estimating advantage function.
-            obs_n, done_n, action_n, advant_n, action_dist_n, baseline_n, returns_n, init_state_n = [
-                ], [], [], [], [], [], [], []
+            (obs_n, done_n, action_n, advant_n,
+             action_dist_n, baseline_n,
+             returns_n, init_state_n) = [], [], [], [], [], [], [], []
             for paths in pathss:
                 for path in paths:
                     path["baseline"] = self.vf.predict(path)
@@ -198,11 +213,7 @@ class TRPO_RNN_Agent(object):
             print(
                 "Average sum of rewards per episode = %f" %
                 episoderewards.mean())
-            # self.envs[0]._env.spec.reward_threshold)
-            # if episoderewards.mean() > self.envs[0]._env.spec.reward_threshold:
-            # self.train = False
-            # print("Skipping")
-            # continue
+
             if not self.train:
                 print(episoderewards)
                 self.end_count += 1
@@ -210,14 +221,6 @@ class TRPO_RNN_Agent(object):
                     break
                 continue
             print("Training")
-
-            objs = [
-                "obs_n",
-                "done_n",
-                "action_n",
-                "advant_n",
-                "action_dist_n",
-                "init_state_n"]
 
             feed = {self.obs_multi: obs_n,
                     self.done: done_n,
@@ -306,7 +309,7 @@ else:
     task = "Pendulum-v0"
 
 envs = []
-for i in range(config.bs):
+for i in range(FLAGS.bs):
     env = gym.envs.make(task)
     env.monitor.start(training_dir)
     envs.append(env)
